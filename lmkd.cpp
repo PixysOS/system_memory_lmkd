@@ -42,6 +42,7 @@
 #include <cutils/sockets.h>
 #include <liblmkd_utils.h>
 #include <lmkd.h>
+#include <lmkd_hooks.h>
 #include <log/log.h>
 #include <log/log_event_list.h>
 #include <log/log_time.h>
@@ -65,19 +66,17 @@
 #define ATRACE_TAG ATRACE_TAG_ALWAYS
 #include <cutils/trace.h>
 
-static inline void trace_kill_start(int pid, const char *desc) {
-    ATRACE_INT("kill_one_process", pid);
+static inline void trace_kill_start(const char *desc) {
     ATRACE_BEGIN(desc);
 }
 
 static inline void trace_kill_end() {
     ATRACE_END();
-    ATRACE_INT("kill_one_process", 0);
 }
 
 #else /* LMKD_TRACE_KILLS */
 
-static inline void trace_kill_start(int, const char *) {}
+static inline void trace_kill_start(const char *) {}
 static inline void trace_kill_end() {}
 
 #endif /* LMKD_TRACE_KILLS */
@@ -451,6 +450,7 @@ union meminfo {
         /* fields below are calculated rather than read from the file */
         int64_t nr_file_pages;
         int64_t total_gpu_kb;
+        int64_t easy_available;
     } field;
     int64_t arr[MI_FIELD_COUNT];
 };
@@ -468,7 +468,7 @@ enum vmstat_field {
     VS_FIELD_COUNT
 };
 
-static const char* const vmstat_field_names[MI_FIELD_COUNT] = {
+static const char* const vmstat_field_names[VS_FIELD_COUNT] = {
     "nr_free_pages",
     "nr_inactive_file",
     "nr_active_file",
@@ -548,7 +548,7 @@ static uint32_t killcnt_total = 0;
 /* PAGE_SIZE / 1024 */
 static long page_k;
 
-static void update_props();
+static bool update_props();
 static bool init_monitors();
 static void destroy_monitors();
 
@@ -1524,14 +1524,19 @@ static void ctrl_command_handler(int dsock_idx) {
     case LMK_UPDATE_PROPS:
         if (nargs != 0)
             goto wronglen;
-        update_props();
-        if (!use_inkernel_interface) {
-            /* Reinitialize monitors to apply new settings */
-            destroy_monitors();
-            result = init_monitors() ? 0 : -1;
-        } else {
-            result = 0;
+        result = -1;
+        if (update_props()) {
+            if (!use_inkernel_interface) {
+                /* Reinitialize monitors to apply new settings */
+                destroy_monitors();
+                if (init_monitors()) {
+                    result = 0;
+                }
+            } else {
+                result = 0;
+            }
         }
+
         len = lmkd_pack_set_update_props_repl(packet, result);
         if (ctrl_data_write(dsock_idx, (char *)packet, len) != len) {
             ALOGE("Failed to report operation results");
@@ -1834,7 +1839,7 @@ static bool meminfo_parse_line(char *line, union meminfo *mi) {
 
 static int64_t read_gpu_total_kb() {
     static int fd = android::bpf::bpfFdGet(
-            "/sys/fs/bpf/map_gpu_mem_gpu_mem_total_map", BPF_F_RDONLY);
+            "/sys/fs/bpf/map_gpuMem_gpu_mem_total_map", BPF_F_RDONLY);
     static constexpr uint64_t kBpfKeyGpuTotalUsage = 0;
     uint64_t value;
 
@@ -1872,8 +1877,17 @@ static int meminfo_parse(union meminfo *mi) {
     mi->field.nr_file_pages = mi->field.cached + mi->field.swap_cached +
         mi->field.buffers;
     mi->field.total_gpu_kb = read_gpu_total_kb();
+    mi->field.easy_available = mi->field.nr_free_pages + mi->field.inactive_file;
 
     return 0;
+}
+
+// In the case of ZRAM, mi->field.free_swap can't be used directly because swap space is taken
+// from the free memory or reclaimed. Use the lowest of free_swap and easily available memory to
+// measure free swap because they represent how much swap space the system will consider to use
+// and how much it can actually use.
+static inline int64_t get_free_swap(union meminfo *mi) {
+    return std::min(mi->field.free_swap, mi->field.easy_available);
 }
 
 /* /proc/vmstat parsing routines */
@@ -2334,7 +2348,18 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     snprintf(desc, sizeof(desc), "lmk,%d,%d,%d,%d,%d", pid, ki ? (int)ki->kill_reason : -1,
              procp->oomadj, min_oom_score, ki ? ki->max_thrashing : -1);
 
-    trace_kill_start(pid, desc);
+    result = lmkd_free_memory_before_kill_hook(procp, rss_kb / page_k, procp->oomadj,
+                                               ki ? (int)ki->kill_reason : -1);
+    if (result > 0) {
+      /*
+       * Memory was freed elsewhere; no need to kill. Note: intentionally do not
+       * pid_remove(pid) since it was not killed.
+       */
+      ALOGI("Skipping kill; %ld kB freed elsewhere.", result * page_k);
+      return result;
+    }
+
+    trace_kill_start(desc);
 
     start_wait_for_proc_kill(pidfd < 0 ? pid : pidfd);
     kill_result = reaper.kill({ pidfd, pid, uid }, false);
@@ -2373,7 +2398,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     kill_st.oom_score = procp->oomadj;
     kill_st.min_oom_score = min_oom_score;
     kill_st.free_mem_kb = mi->field.nr_free_pages * page_k;
-    kill_st.free_swap_kb = mi->field.free_swap * page_k;
+    kill_st.free_swap_kb = get_free_swap(mi) * page_k;
     stats_write_lmk_kill_occurred(&kill_st, mem_st);
 
     ctrl_data_write_lmk_kill_occurred((pid_t)pid, uid);
@@ -2549,7 +2574,7 @@ void calc_zone_watermarks(struct zoneinfo *zi, struct zone_watermarks *watermark
 }
 
 static int calc_swap_utilization(union meminfo *mi) {
-    int64_t swap_used = mi->field.total_swap - mi->field.free_swap;
+    int64_t swap_used = mi->field.total_swap - get_free_swap(mi);
     int64_t total_swappable = mi->field.active_anon + mi->field.inactive_anon +
                               mi->field.shmem + swap_used;
     return total_swappable > 0 ? (swap_used * 100) / total_swappable : 0;
@@ -2642,17 +2667,17 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     /* Check free swap levels */
     if (swap_free_low_percentage) {
         swap_low_threshold = mi.field.total_swap * swap_free_low_percentage / 100;
-        swap_is_low = mi.field.free_swap < swap_low_threshold;
+        swap_is_low = get_free_swap(&mi) < swap_low_threshold;
     } else {
         swap_low_threshold = 0;
     }
 
     /* Identify reclaim state */
-    if (vs.field.pgscan_direct > init_pgscan_direct) {
+    if (vs.field.pgscan_direct != init_pgscan_direct) {
         init_pgscan_direct = vs.field.pgscan_direct;
         init_pgscan_kswapd = vs.field.pgscan_kswapd;
         reclaim = DIRECT_RECLAIM;
-    } else if (vs.field.pgscan_kswapd > init_pgscan_kswapd) {
+    } else if (vs.field.pgscan_kswapd != init_pgscan_kswapd) {
         init_pgscan_kswapd = vs.field.pgscan_kswapd;
         reclaim = KSWAPD_RECLAIM;
     } else if (workingset_refault_file == prev_workingset_refault) {
@@ -2755,7 +2780,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         kill_reason = LOW_SWAP_AND_THRASHING;
         snprintf(kill_desc, sizeof(kill_desc), "device is low on swap (%" PRId64
             "kB < %" PRId64 "kB) and thrashing (%" PRId64 "%%)",
-            mi.field.free_swap * page_k, swap_low_threshold * page_k, thrashing);
+            get_free_swap(&mi) * page_k, swap_low_threshold * page_k, thrashing);
         /* Do not kill perceptible apps unless below min watermark or heavily thrashing */
         if (wmark > WMARK_MIN && thrashing < thrashing_critical_pct) {
             min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
@@ -2766,7 +2791,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         kill_reason = LOW_MEM_AND_SWAP;
         snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached and swap is low (%"
             PRId64 "kB < %" PRId64 "kB)", wmark < WMARK_LOW ? "min" : "low",
-            mi.field.free_swap * page_k, swap_low_threshold * page_k);
+            get_free_swap(&mi) * page_k, swap_low_threshold * page_k);
         /* Do not kill perceptible apps unless below min watermark or heavily thrashing */
         if (wmark > WMARK_MIN && thrashing < thrashing_critical_pct) {
             min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
@@ -3045,7 +3070,7 @@ static void mp_event_common(int data, uint32_t events, struct polling_params *po
 
     // If we still have enough swap space available, check if we want to
     // ignore/downgrade pressure events.
-    if (mi.field.free_swap >=
+    if (get_free_swap(&mi) >=
         mi.field.total_swap * swap_free_low_percentage / 100) {
         // If the pressure is larger than downgrade_pressure lmk will not
         // kill any process, since enough memory is available.
@@ -3066,7 +3091,8 @@ static void mp_event_common(int data, uint32_t events, struct polling_params *po
 do_kill:
     if (low_ram_device) {
         /* For Go devices kill only one task */
-        if (find_and_kill_process(level_oomadj[level], NULL, &mi, &wi, &curr_tm, NULL) == 0) {
+        if (find_and_kill_process(use_minfree_levels ? min_score_adj : level_oomadj[level],
+                                  NULL, &mi, &wi, &curr_tm, NULL) == 0) {
             if (debug_process_killing) {
                 ALOGI("Nothing to kill");
             }
@@ -3253,7 +3279,7 @@ static bool init_mp_common(enum vmpressure_level level) {
         goto err_open_mpfd;
     }
 
-    evctlfd = open(GetCgroupAttributePath("CgroupEventControl").c_str(), O_WRONLY | O_CLOEXEC);
+    evctlfd = open(GetCgroupAttributePath("MemCgroupEventControl").c_str(), O_WRONLY | O_CLOEXEC);
     if (evctlfd < 0) {
         ALOGI("No kernel memory cgroup event control (errno=%d)", errno);
         goto err_open_evctlfd;
@@ -3513,6 +3539,11 @@ static int init(void) {
     }
     ALOGI("Process polling is %s", pidfd_supported ? "supported" : "not supported" );
 
+    if (!lmkd_init_hook()) {
+        ALOGE("Failed to initialize LMKD hooks.");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -3557,7 +3588,8 @@ static void call_handler(struct event_handler_info* handler_info,
         resume_polling(poll_params, curr_tm);
         break;
     case POLLING_DO_NOT_CHANGE:
-        if (get_time_diff_ms(&poll_params->poll_start_tm, &curr_tm) > PSI_WINDOW_SIZE_MS) {
+        if (poll_params->poll_handler &&
+            get_time_diff_ms(&poll_params->poll_start_tm, &curr_tm) > PSI_WINDOW_SIZE_MS) {
             /* Polled for the duration of PSI window, time to stop */
             poll_params->poll_handler = NULL;
         }
@@ -3700,7 +3732,7 @@ int issue_reinit() {
     return res == UPDATE_PROPS_SUCCESS ? 0 : -1;
 }
 
-static void update_props() {
+static bool update_props() {
     /* By default disable low level vmpressure events */
     level_oomadj[VMPRESS_LEVEL_LOW] =
         GET_LMK_PROPERTY(int32, "low", OOM_SCORE_ADJ_MAX + 1);
@@ -3744,6 +3776,14 @@ static void update_props() {
     stall_limit_critical = GET_LMK_PROPERTY(int64, "stall_limit_critical", 100);
 
     reaper.enable_debug(debug_process_killing);
+
+    /* Call the update props hook */
+    if (!lmkd_update_props_hook()) {
+        ALOGE("Failed to update LMKD hook props.");
+        return false;
+    }
+
+    return true;
 }
 
 int main(int argc, char **argv) {
@@ -3754,7 +3794,10 @@ int main(int argc, char **argv) {
         return issue_reinit();
     }
 
-    update_props();
+    if (!update_props()) {
+        ALOGE("Failed to initialize props, exiting.");
+        return -1;
+    }
 
     ctx = create_android_logger(KILLINFO_LOG_TAG);
 
